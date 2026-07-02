@@ -1003,10 +1003,7 @@ private enum TeamsConferenceReader {
       return nil
     }
 
-    let title = matchingMeetingWindowTitle(for: applications)
-      ?? (hasActiveCallHelper() ? "Teams Meeting" : nil)
-
-    guard let title else {
+    guard let title = matchingMeetingWindowTitle(for: applications) else {
       return nil
     }
 
@@ -1111,59 +1108,6 @@ private enum TeamsConferenceReader {
     }
 
     return positiveTitleTokens.contains(where: { normalizedTitle.contains($0) })
-  }
-
-  private static func hasActiveCallHelper() -> Bool {
-    guard let output = processOutput(
-      executablePath: "/usr/bin/pgrep",
-      arguments: [
-        "-fl",
-        "Microsoft Teams|MSTeams|teams2|SlimCore|video_capture|audio\\.mojom"
-      ]
-    )?.lowercased() else {
-      return false
-    }
-
-    let teamsOutput = output
-      .split(separator: "\n")
-      .filter { line in
-        line.contains("microsoft teams")
-          || line.contains("msteams")
-          || line.contains("teams2")
-      }
-      .joined(separator: "\n")
-
-    let hasMediaService = teamsOutput.contains("video_capture.mojom.videocaptureservice")
-      || teamsOutput.contains("audio.mojom.audioservice")
-    let hasCallEngine = teamsOutput.contains("microsoft teams modulehost")
-      && teamsOutput.contains("slimcore")
-
-    return hasMediaService && hasCallEngine
-  }
-
-  private static func processOutput(executablePath: String, arguments: [String]) -> String? {
-    let process = Process()
-    let pipe = Pipe()
-
-    process.executableURL = URL(fileURLWithPath: executablePath)
-    process.arguments = arguments
-    process.standardOutput = pipe
-    process.standardError = Pipe()
-
-    do {
-      try process.run()
-    } catch {
-      return nil
-    }
-
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-
-    guard process.terminationStatus == 0 else {
-      return nil
-    }
-
-    return String(data: data, encoding: .utf8)
   }
 
   private static func normalizedMeetingTitle(_ title: String) -> String {
