@@ -33,6 +33,42 @@ private enum AppIconAsset {
   }
 }
 
+@MainActor
+private final class NotchySettings: ObservableObject {
+  static let shared = NotchySettings()
+
+  private static let animationsEnabledKey = "notchy.animationsEnabled"
+  private static let showsDockIconKey = "notchy.showsDockIcon"
+  static let dockIconVisibilityDidChange = Notification.Name("notchy.dockIconVisibilityDidChange")
+
+  @Published var animationsEnabled: Bool {
+    didSet {
+      UserDefaults.standard.set(animationsEnabled, forKey: Self.animationsEnabledKey)
+    }
+  }
+
+  @Published var showsDockIcon: Bool {
+    didSet {
+      UserDefaults.standard.set(showsDockIcon, forKey: Self.showsDockIconKey)
+      NotificationCenter.default.post(name: Self.dockIconVisibilityDidChange, object: self)
+    }
+  }
+
+  private init() {
+    if UserDefaults.standard.object(forKey: Self.animationsEnabledKey) == nil {
+      animationsEnabled = true
+    } else {
+      animationsEnabled = UserDefaults.standard.bool(forKey: Self.animationsEnabledKey)
+    }
+
+    if UserDefaults.standard.object(forKey: Self.showsDockIconKey) == nil {
+      showsDockIcon = true
+    } else {
+      showsDockIcon = UserDefaults.standard.bool(forKey: Self.showsDockIconKey)
+    }
+  }
+}
+
 private struct AudioOutputRoute: Equatable, Sendable {
   enum Kind: Equatable, Sendable {
     case systemSpeaker
@@ -92,6 +128,14 @@ private struct NowPlayingItem: Equatable, Sendable {
     playbackRate > 0.01
   }
 
+  var hasKnownPlaybackState: Bool {
+    playbackRate >= 0
+  }
+
+  var hasUnknownPlaybackState: Bool {
+    !hasKnownPlaybackState
+  }
+
   var hasTimedProgress: Bool {
     duration > 0
   }
@@ -135,6 +179,10 @@ private struct NowPlayingItem: Equatable, Sendable {
 
   func timeLabel(at date: Date) -> String {
     guard duration > 0 else {
+      guard hasKnownPlaybackState else {
+        return "Playing"
+      }
+
       return isPlaying ? "Playing" : "Paused"
     }
 
@@ -178,6 +226,17 @@ private struct NowPlayingItem: Equatable, Sendable {
     return lhs.count >= 16
       && rhs.count >= 16
       && (lhs.contains(rhs) || rhs.contains(lhs))
+  }
+
+  func isSameSource(as other: NowPlayingItem) -> Bool {
+    let lhs = Self.normalizedIdentity(source)
+    let rhs = Self.normalizedIdentity(other.source)
+
+    guard !lhs.isEmpty, !rhs.isEmpty else {
+      return false
+    }
+
+    return lhs == rhs || lhs.contains(rhs) || rhs.contains(lhs)
   }
 
   init(
@@ -289,6 +348,17 @@ private struct NowPlayingItem: Equatable, Sendable {
   }
 }
 
+private struct ConferenceSession: Equatable, Sendable {
+  var title: String
+  var source: String
+  var detail: String
+  var timestamp: Date
+
+  var subtitle: String {
+    "\(source) • \(detail)"
+  }
+}
+
 private struct NowPlayingCandidate: Sendable {
   let item: NowPlayingItem
   let priority: Int
@@ -298,7 +368,7 @@ private struct NowPlayingCandidate: Sendable {
   }
 
   static func bestCandidate(in candidates: [NowPlayingCandidate]) -> NowPlayingCandidate? {
-    candidates.sorted { lhs, rhs in
+    let sortedCandidates = candidates.sorted { lhs, rhs in
       if lhs.priority != rhs.priority {
         return lhs.priority > rhs.priority
       }
@@ -308,7 +378,23 @@ private struct NowPlayingCandidate: Sendable {
       }
 
       return lhs.item.timestamp > rhs.item.timestamp
-    }.first
+    }
+
+    guard let best = sortedCandidates.first else {
+      return nil
+    }
+
+    if best.item.isPlaying,
+       let pausedCandidate = sortedCandidates.first(where: { candidate in
+         !candidate.item.isPlaying
+           && candidate.item.hasTimedProgress
+           && candidate.item.isSameMedia(as: best.item)
+           && candidate.item.isSameSource(as: best.item)
+       }) {
+      return pausedCandidate
+    }
+
+    return best
   }
 }
 
@@ -423,6 +509,70 @@ private func normalizedText(_ value: String, fallback: String) -> String {
 private func normalizedOptionalText(_ value: String) -> String? {
   let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
   return text.isEmpty ? nil : text
+}
+
+@MainActor
+private final class ConferenceMonitor: ObservableObject {
+  @Published private(set) var session: ConferenceSession?
+
+  private var timer: Timer?
+  private var workspaceObservers: [NSObjectProtocol] = []
+  private var isRefreshing = false
+
+  init() {
+    requestRefresh()
+    timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+      Task { @MainActor in
+        self?.requestRefresh()
+      }
+    }
+
+    let notificationCenter = NSWorkspace.shared.notificationCenter
+    for name in [
+      NSWorkspace.didLaunchApplicationNotification,
+      NSWorkspace.didTerminateApplicationNotification,
+      NSWorkspace.didActivateApplicationNotification
+    ] {
+      workspaceObservers.append(
+        notificationCenter.addObserver(
+          forName: name,
+          object: nil,
+          queue: .main
+        ) { [weak self] _ in
+          Task { @MainActor in
+            self?.requestRefresh()
+          }
+        }
+      )
+    }
+  }
+
+  @MainActor
+  deinit {
+    timer?.invalidate()
+    let notificationCenter = NSWorkspace.shared.notificationCenter
+    workspaceObservers.forEach { notificationCenter.removeObserver($0) }
+  }
+
+  func requestRefresh() {
+    guard !isRefreshing else {
+      return
+    }
+
+    isRefreshing = true
+    ConferenceReader.currentSession { [weak self] session in
+      Task { @MainActor in
+        guard let self else {
+          return
+        }
+
+        self.isRefreshing = false
+        if self.session != session {
+          self.session = session
+        }
+      }
+    }
+  }
 }
 
 @MainActor
@@ -741,7 +891,179 @@ private enum NowPlayingReader {
     let item = candidate.item
     let elapsed = Int(item.effectiveElapsedTime.rounded())
     let duration = Int(item.duration.rounded())
-    return "priority=\(candidate.priority) source=\(item.source) playing=\(item.isPlaying) elapsed=\(elapsed) duration=\(duration) title=\"\(item.title)\" subtitle=\"\(item.subtitle)\""
+    let playbackState = item.hasKnownPlaybackState
+      ? (item.isPlaying ? "playing" : "paused")
+      : "unknown"
+    return "priority=\(candidate.priority) source=\(item.source) state=\(playbackState) elapsed=\(elapsed) duration=\(duration) title=\"\(item.title)\" subtitle=\"\(item.subtitle)\""
+  }
+}
+
+private enum ConferenceReader {
+  static func currentSession(completion: @escaping @Sendable (ConferenceSession?) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+      completion(TeamsConferenceReader.currentSession())
+    }
+  }
+}
+
+private enum TeamsConferenceReader {
+  private struct ConferencingApp: Sendable {
+    let bundleIdentifiers: [String]
+    let displayName: String
+    let iconSource: String
+    let appPaths: [String]
+  }
+
+  private static let app = ConferencingApp(
+    bundleIdentifiers: [
+      "com.microsoft.teams2",
+      "com.microsoft.teams"
+    ],
+    displayName: "Microsoft Teams",
+    iconSource: "Microsoft Teams",
+    appPaths: [
+      "/Applications/Microsoft Teams.app",
+      "~/Applications/Microsoft Teams.app"
+    ]
+  )
+
+  private static let positiveTitleTokens = [
+    "meeting",
+    "call",
+    "teams meeting",
+    "screen share",
+    "sharing",
+    "presenting",
+    "会议",
+    "通话",
+    "来电",
+    "屏幕共享",
+    "共享"
+  ]
+
+  private static let negativeTitleTokens = [
+    "notification",
+    "reminder",
+    "preferences",
+    "settings",
+    "通知",
+    "提醒",
+    "设置"
+  ]
+
+  static func currentSession() -> ConferenceSession? {
+    let applications = runningApplications(for: app)
+
+    guard !applications.isEmpty,
+          let title = matchingMeetingWindowTitle(for: applications) else {
+      return nil
+    }
+
+    return ConferenceSession(
+      title: normalizedMeetingTitle(title),
+      source: app.displayName,
+      detail: "Audio/Video Meeting",
+      timestamp: Date()
+    )
+  }
+
+  private static func runningApplications(for app: ConferencingApp) -> [NSRunningApplication] {
+    var applications = app.bundleIdentifiers.flatMap {
+      NSRunningApplication.runningApplications(withBundleIdentifier: $0)
+    }
+
+    if applications.isEmpty {
+      applications = NSWorkspace.shared.runningApplications.filter { runningApplication in
+        let localizedName = runningApplication.localizedName?.lowercased() ?? ""
+        return localizedName.contains("microsoft teams")
+      }
+    }
+
+    return applications
+  }
+
+  private static func matchingMeetingWindowTitle(for applications: [NSRunningApplication]) -> String? {
+    let processIDs = Set(applications.map(\.processIdentifier))
+
+    guard let windowInfo = CGWindowListCopyWindowInfo(
+      [.optionOnScreenOnly, .excludeDesktopElements],
+      CGWindowID(0)
+    ) as? [[String: Any]] else {
+      return nil
+    }
+
+    return windowInfo
+      .compactMap { window -> String? in
+        guard let processID = processIdentifier(from: window),
+              processIDs.contains(processID),
+              isVisibleWindow(window),
+              let title = window[kCGWindowName as String] as? String,
+              isMeetingWindowTitle(title) else {
+          return nil
+        }
+
+        return title
+      }
+      .first
+  }
+
+  private static func processIdentifier(from window: [String: Any]) -> pid_t? {
+    if let processIdentifier = window[kCGWindowOwnerPID as String] as? pid_t {
+      return processIdentifier
+    }
+
+    if let number = window[kCGWindowOwnerPID as String] as? NSNumber {
+      return pid_t(number.int32Value)
+    }
+
+    return nil
+  }
+
+  private static func isVisibleWindow(_ window: [String: Any]) -> Bool {
+    if let layer = window[kCGWindowLayer as String] as? Int, layer != 0 {
+      return false
+    }
+
+    guard let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary,
+          let bounds = CGRect(dictionaryRepresentation: boundsDictionary) else {
+      return true
+    }
+
+    return bounds.width >= 160 && bounds.height >= 120
+  }
+
+  private static func isMeetingWindowTitle(_ title: String) -> Bool {
+    let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+    guard !normalizedTitle.isEmpty,
+          positiveTitleTokens.contains(where: { normalizedTitle.contains($0) }) else {
+      return false
+    }
+
+    return !negativeTitleTokens.contains(where: { normalizedTitle.contains($0) })
+  }
+
+  private static func normalizedMeetingTitle(_ title: String) -> String {
+    var cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    for suffix in [
+      " | Microsoft Teams",
+      " - Microsoft Teams",
+      " — Microsoft Teams",
+      " – Microsoft Teams"
+    ] {
+      if cleanedTitle.hasSuffix(suffix) {
+        cleanedTitle.removeLast(suffix.count)
+      }
+    }
+
+    let loweredTitle = cleanedTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+    if loweredTitle.isEmpty || loweredTitle == "meeting" || loweredTitle == "call" {
+      return "Teams Meeting"
+    }
+
+    return cleanedTitle
   }
 }
 
@@ -919,6 +1241,23 @@ private enum BrowserNowPlayingReader {
     let displayName: String
     let titleProperty: String
     let supportsJavaScriptProgress: Bool
+    let supportsInactiveTabJavaScriptScan: Bool
+
+    init(
+      bundleIdentifier: String,
+      appPath: String,
+      displayName: String,
+      titleProperty: String,
+      supportsJavaScriptProgress: Bool,
+      supportsInactiveTabJavaScriptScan: Bool = true
+    ) {
+      self.bundleIdentifier = bundleIdentifier
+      self.appPath = appPath
+      self.displayName = displayName
+      self.titleProperty = titleProperty
+      self.supportsJavaScriptProgress = supportsJavaScriptProgress
+      self.supportsInactiveTabJavaScriptScan = supportsInactiveTabJavaScriptScan
+    }
   }
 
   private struct BrowserPlaybackInfo {
@@ -961,6 +1300,20 @@ private enum BrowserNowPlayingReader {
       supportsJavaScriptProgress: true
     ),
     Browser(
+      bundleIdentifier: "company.thebrowser.Browser",
+      appPath: "/Applications/Arc.app",
+      displayName: "Arc",
+      titleProperty: "title",
+      supportsJavaScriptProgress: true
+    ),
+    Browser(
+      bundleIdentifier: "com.brave.Browser",
+      appPath: "/Applications/Brave Browser.app",
+      displayName: "Brave Browser",
+      titleProperty: "title",
+      supportsJavaScriptProgress: true
+    ),
+    Browser(
       bundleIdentifier: "com.microsoft.edgemac",
       appPath: "/Applications/Microsoft Edge.app",
       displayName: "Microsoft Edge",
@@ -972,12 +1325,34 @@ private enum BrowserNowPlayingReader {
       appPath: "/Applications/Dia.app",
       displayName: "Dia",
       titleProperty: "title",
-      supportsJavaScriptProgress: false
+      supportsJavaScriptProgress: true,
+      supportsInactiveTabJavaScriptScan: false
     ),
     Browser(
       bundleIdentifier: "com.microsoft.edgemac.Canary",
       appPath: "/Applications/Microsoft Edge Canary.app",
       displayName: "Edge Canary",
+      titleProperty: "title",
+      supportsJavaScriptProgress: true
+    ),
+    Browser(
+      bundleIdentifier: "com.vivaldi.Vivaldi",
+      appPath: "/Applications/Vivaldi.app",
+      displayName: "Vivaldi",
+      titleProperty: "title",
+      supportsJavaScriptProgress: true
+    ),
+    Browser(
+      bundleIdentifier: "com.operasoftware.Opera",
+      appPath: "/Applications/Opera.app",
+      displayName: "Opera",
+      titleProperty: "title",
+      supportsJavaScriptProgress: true
+    ),
+    Browser(
+      bundleIdentifier: "com.operasoftware.OperaGX",
+      appPath: "/Applications/Opera GX.app",
+      displayName: "Opera GX",
       titleProperty: "title",
       supportsJavaScriptProgress: true
     ),
@@ -1045,6 +1420,11 @@ private enum BrowserNowPlayingReader {
 
     for state in states {
       AppleScriptRunner.debugLog("checking all-tab playback: \(state.browser.displayName)")
+      guard state.browser.supportsInactiveTabJavaScriptScan else {
+        AppleScriptRunner.debugLog("all-tab playback skipped: \(state.browser.displayName)")
+        continue
+      }
+
       guard let candidate = readNowPlayingPlaybackCandidate(
         from: state.browser,
         applications: state.applications,
@@ -1060,6 +1440,10 @@ private enum BrowserNowPlayingReader {
       }
 
       playbackCandidates.append(candidate)
+    }
+
+    if let candidate = NowPlayingCandidate.bestCandidate(in: playbackCandidates) {
+      return candidate
     }
 
     let tabCandidates = states
@@ -1104,7 +1488,7 @@ private enum BrowserNowPlayingReader {
     applications: [NSRunningApplication]
   ) -> BrowserTabCandidate? {
     guard let tabInfo = browserActiveTabInfo(for: browser),
-          isYouTubeWatchURL(tabInfo.url) else {
+          isLikelyMediaTab(title: tabInfo.title, url: tabInfo.url) else {
       return nil
     }
 
@@ -1115,7 +1499,7 @@ private enum BrowserNowPlayingReader {
         source: browser.displayName,
         duration: 0,
         elapsedTime: 0,
-        playbackRate: 1,
+        playbackRate: -1,
         timestamp: Date()
       ),
       isActive: applications.contains(where: { $0.isActive })
@@ -1126,19 +1510,18 @@ private enum BrowserNowPlayingReader {
     from browser: Browser,
     applications: [NSRunningApplication]
   ) -> BrowserTabCandidate? {
-    guard let tabInfo = browserTabInfo(for: browser),
-          let youtubeTab = tabInfo.first(where: { isYouTubeWatchURL($0.url) }) else {
+    guard let mediaTab = browserMediaTabInfo(for: browser) else {
       return nil
     }
 
     return BrowserTabCandidate(
       item: NowPlayingItem(
-        title: normalizedTitle(youtubeTab.title, url: youtubeTab.url),
+        title: normalizedTitle(mediaTab.title, url: mediaTab.url),
         artist: nil,
         source: browser.displayName,
         duration: 0,
         elapsedTime: 0,
-        playbackRate: 1,
+        playbackRate: -1,
         timestamp: Date()
       ),
       isActive: applications.contains(where: { $0.isActive })
@@ -1216,40 +1599,40 @@ private enum BrowserNowPlayingReader {
     return (title: parts.dropFirst().joined(separator: fieldSeparator), url: url)
   }
 
-  private static func browserTabInfo(for browser: Browser) -> [(title: String, url: String)]? {
+  private static func browserMediaTabInfo(for browser: Browser) -> (title: String, url: String)? {
     let script = """
       tell application id "\(browser.bundleIdentifier)"
-        set tabRows to {}
-        repeat with browserWindow in windows
-          repeat with browserTab in tabs of browserWindow
-            set tabURL to URL of browserTab
-            if tabURL is not missing value then
-              set tabTitle to \(browser.titleProperty) of browserTab
-              if tabTitle is missing value then set tabTitle to ""
-              set end of tabRows to tabURL & "\(Self.fieldSeparator)" & tabTitle
-            end if
+        with timeout of 2 seconds
+          repeat with browserWindow in windows
+            repeat with browserTab in tabs of browserWindow
+              try
+                set tabURL to URL of browserTab
+                if tabURL is not missing value then
+                  set tabTitle to \(browser.titleProperty) of browserTab
+                  if tabTitle is missing value then set tabTitle to ""
+                  if tabURL contains "youtube.com/watch" or tabURL contains "music.youtube.com/watch" or tabURL contains "youtu.be/" or tabURL contains "youtube.com/shorts/" or tabURL contains "youtube.com/live/" or tabURL contains "youtube.com/embed/" or tabTitle ends with " - YouTube" then
+                    return tabURL & "\(Self.fieldSeparator)" & tabTitle
+                  end if
+                end if
+              end try
+            end repeat
           end repeat
-        end repeat
-        set AppleScript's text item delimiters to "\(Self.rowSeparator)"
-        return tabRows as text
+        end timeout
       end tell
+      return ""
       """
 
     guard let output = AppleScriptRunner.run(script), !output.isEmpty else {
       return nil
     }
 
-    return output
-      .components(separatedBy: rowSeparator)
-      .compactMap { row in
-        let parts = row.components(separatedBy: fieldSeparator)
+    let parts = output.components(separatedBy: fieldSeparator)
 
-        guard let url = parts.first, !url.isEmpty else {
-          return nil
-        }
+    guard let url = parts.first, !url.isEmpty else {
+      return nil
+    }
 
-        return (title: parts.dropFirst().joined(separator: fieldSeparator), url: url)
-      }
+    return (title: parts.dropFirst().joined(separator: fieldSeparator), url: url)
   }
 
   private static func runningApplications(for browser: Browser) -> [NSRunningApplication] {
@@ -1312,6 +1695,18 @@ private enum BrowserNowPlayingReader {
     return lowercasedURL.contains("youtube.com/watch")
       || lowercasedURL.contains("music.youtube.com/watch")
       || lowercasedURL.contains("youtu.be/")
+      || lowercasedURL.contains("youtube.com/shorts/")
+      || lowercasedURL.contains("youtube.com/live/")
+      || lowercasedURL.contains("youtube.com/embed/")
+  }
+
+  private static func isLikelyMediaTab(title: String, url: String) -> Bool {
+    if isYouTubeWatchURL(url) {
+      return true
+    }
+
+    let lowercasedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return lowercasedTitle.hasSuffix(" - youtube")
   }
 
   private static func normalizedTitle(_ title: String, url: String) -> String {
@@ -1329,7 +1724,6 @@ private enum BrowserNowPlayingReader {
   }
 
   private static let fieldSeparator = "__EDGED_FIELD__"
-  private static let rowSeparator = "__EDGED_ROW__"
   private static let mediaStateJavaScript = """
     (() => {
       const mediaItems = Array.from(document.querySelectorAll('video,audio'));
@@ -1890,6 +2284,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var panels: [NSPanel] = []
   private var hoverPanels: [NSPanel] = []
   private var anchorFrames: [CGRect] = []
+  private var settingsWindowController: NSWindowController?
+  private var statusItem: NSStatusItem?
+  private var settingsObservers: [NSObjectProtocol] = []
   private var didStart = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1900,7 +2297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     guard !didStart else { return }
     didStart = true
 
-    NSApp.setActivationPolicy(.regular)
+    applyDockIconVisibility()
     installDockIcon()
     installMenu()
     createIslandWindows()
@@ -1910,7 +2307,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       name: NSApplication.didChangeScreenParametersNotification,
       object: nil
     )
+    settingsObservers.append(
+      NotificationCenter.default.addObserver(
+        forName: NotchySettings.dockIconVisibilityDidChange,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor in
+          self?.applyDockIconVisibility()
+        }
+      }
+    )
     NSApp.activate(ignoringOtherApps: true)
+  }
+
+  @MainActor
+  deinit {
+    let notificationCenter = NotificationCenter.default
+    settingsObservers.forEach { notificationCenter.removeObserver($0) }
   }
 
   private func installDockIcon() {
@@ -1918,20 +2332,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     NSApp.applicationIconImage = image
   }
 
+  private func applyDockIconVisibility() {
+    if NotchySettings.shared.showsDockIcon {
+      NSApp.setActivationPolicy(.regular)
+      removeStatusItem()
+    } else {
+      NSApp.setActivationPolicy(.accessory)
+      installStatusItem()
+    }
+  }
+
+  private func installStatusItem() {
+    guard statusItem == nil else { return }
+
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    if let image = AppIconAsset.dockIcon()?.copy() as? NSImage {
+      image.size = NSSize(width: 18, height: 18)
+      image.isTemplate = false
+      item.button?.image = image
+    } else {
+      item.button?.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Notchy")
+    }
+    item.button?.toolTip = "Notchy"
+    item.menu = makeControlMenu()
+    statusItem = item
+  }
+
+  private func removeStatusItem() {
+    guard let statusItem else { return }
+    NSStatusBar.system.removeStatusItem(statusItem)
+    self.statusItem = nil
+  }
+
   private func installMenu() {
     let mainMenu = NSMenu()
     let appMenuItem = NSMenuItem()
-    let appMenu = NSMenu()
+    let appMenu = makeControlMenu()
 
-    appMenu.addItem(
-      NSMenuItem(
-        title: "Allow QuickTime Access",
-        action: #selector(requestQuickTimeAccess(_:)),
-        keyEquivalent: ""
-      )
+    appMenuItem.submenu = appMenu
+    mainMenu.addItem(appMenuItem)
+    NSApp.mainMenu = mainMenu
+  }
+
+  private func makeControlMenu() -> NSMenu {
+    let menu = NSMenu()
+    let settingsItem = NSMenuItem(
+      title: "Settings...",
+      action: #selector(showSettings(_:)),
+      keyEquivalent: ","
     )
-    appMenu.addItem(.separator())
-    appMenu.addItem(
+    settingsItem.target = self
+    menu.addItem(settingsItem)
+
+    let aboutItem = NSMenuItem(
+      title: "About Notchy",
+      action: #selector(showAbout(_:)),
+      keyEquivalent: ""
+    )
+    aboutItem.target = self
+    menu.addItem(aboutItem)
+
+    menu.addItem(.separator())
+    menu.addItem(
       NSMenuItem(
         title: "Quit Notchy",
         action: #selector(NSApplication.terminate(_:)),
@@ -1939,13 +2401,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       )
     )
 
-    appMenuItem.submenu = appMenu
-    mainMenu.addItem(appMenuItem)
-    NSApp.mainMenu = mainMenu
+    return menu
   }
 
-  @objc private func requestQuickTimeAccess(_ sender: Any?) {
-    QuickTimeNowPlayingReader.requestAutomationPermissionFromUser()
+  @objc private func showAbout(_ sender: Any?) {
+    var options: [NSApplication.AboutPanelOptionKey: Any] = [
+      .applicationName: "Notchy",
+      .version: "0.1.0",
+      .credits: NSAttributedString(string: "A notch-first now playing companion for macOS.")
+    ]
+
+    if let image = AppIconAsset.dockIcon() ?? NSApp.applicationIconImage {
+      options[.applicationIcon] = image
+    }
+
+    NSApp.orderFrontStandardAboutPanel(options: options)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  @objc private func showSettings(_ sender: Any?) {
+    if let window = settingsWindowController?.window {
+      window.makeKeyAndOrderFront(nil)
+      NSApp.activate(ignoringOtherApps: true)
+      return
+    }
+
+    let settingsView = NotchySettingsView(settings: .shared)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 560, height: 460),
+      styleMask: [.titled, .closable, .miniaturizable],
+      backing: .buffered,
+      defer: false
+    )
+    window.center()
+    window.contentView = NSHostingView(rootView: settingsView)
+    window.isReleasedWhenClosed = false
+    window.title = "Notchy Settings"
+
+    let controller = NSWindowController(window: window)
+    settingsWindowController = controller
+    controller.showWindow(nil)
+    NSApp.activate(ignoringOtherApps: true)
   }
 
   @objc private func screenConfigurationDidChange() {
@@ -2132,6 +2628,387 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 }
 
+private struct NotchySettingsView: View {
+  @ObservedObject var settings: NotchySettings
+  @State private var permissionRefreshToken = UUID()
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 16) {
+      generalSettings
+      Divider()
+      permissionSettings
+    }
+    .padding(20)
+    .frame(width: 560, height: 460)
+  }
+
+  private var generalSettings: some View {
+    VStack(spacing: 10) {
+      HStack(spacing: 12) {
+        Text("Animation")
+          .font(.headline)
+
+        Spacer()
+
+        Toggle("Animation", isOn: $settings.animationsEnabled)
+          .toggleStyle(.switch)
+          .labelsHidden()
+      }
+
+      HStack(spacing: 12) {
+        Text("Show Dock Icon")
+          .font(.headline)
+
+        Spacer()
+
+        Toggle("Show Dock Icon", isOn: $settings.showsDockIcon)
+          .toggleStyle(.switch)
+          .labelsHidden()
+      }
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 8)
+  }
+
+  private var permissionSettings: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack {
+        Text("Permissions")
+          .font(.headline)
+
+        Spacer()
+
+        Button {
+          permissionRefreshToken = UUID()
+        } label: {
+          Image(systemName: "arrow.clockwise")
+        }
+        .buttonStyle(.borderless)
+
+        Button("Open Automation") {
+          SystemSettingsNavigator.openAutomationPrivacy()
+        }
+      }
+
+      HStack {
+        Text("Screen Recording")
+          .font(.system(size: 13, weight: .medium))
+
+        Spacer()
+
+        PermissionStateBadge(state: ScreenRecordingPermission.state)
+
+        Button("Request") {
+          ScreenRecordingPermission.request()
+          permissionRefreshToken = UUID()
+        }
+        .disabled(!ScreenRecordingPermission.state.canRequest)
+
+        Button("Open") {
+          SystemSettingsNavigator.openScreenRecordingPrivacy()
+        }
+      }
+      .padding(.horizontal, 10)
+      .padding(.vertical, 8)
+      .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+      ScrollView {
+        LazyVStack(spacing: 8) {
+          ForEach(NotchyPermissionTarget.all) { target in
+            NotchyPermissionRow(
+              target: target,
+              refreshToken: permissionRefreshToken
+            ) {
+              permissionRefreshToken = UUID()
+            }
+          }
+        }
+        .padding(.vertical, 2)
+      }
+    }
+  }
+}
+
+private struct NotchyPermissionRow: View {
+  let target: NotchyPermissionTarget
+  let refreshToken: UUID
+  let onRefresh: () -> Void
+
+  var body: some View {
+    let _ = refreshToken
+    let state = target.permissionState
+
+    HStack(spacing: 12) {
+      MediaSourceAppIconView(source: target.iconSource, size: 26)
+
+      VStack(alignment: .leading, spacing: 2) {
+        Text(target.displayName)
+          .font(.system(size: 13, weight: .medium))
+
+        Text(target.bundleIdentifier)
+          .font(.system(size: 10, weight: .regular))
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.middle)
+      }
+
+      Spacer(minLength: 12)
+
+      PermissionStateBadge(state: state)
+
+      Button("Request") {
+        target.requestPermission()
+        onRefresh()
+      }
+      .disabled(!state.canRequest)
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 8)
+    .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+  }
+}
+
+private struct PermissionStateBadge: View {
+  let state: NotchyPermissionState
+
+  var body: some View {
+    HStack(spacing: 5) {
+      Circle()
+        .fill(state.color)
+        .frame(width: 7, height: 7)
+
+      Text(state.title)
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(.secondary)
+    }
+    .frame(width: 104, alignment: .leading)
+  }
+}
+
+private struct NotchyPermissionTarget: Identifiable {
+  let displayName: String
+  let bundleIdentifier: String
+  let iconSource: String
+  let appPaths: [String]
+
+  var id: String {
+    bundleIdentifier
+  }
+
+  @MainActor
+  var permissionState: NotchyPermissionState {
+    guard isInstalled else {
+      return .notInstalled
+    }
+
+    return NotchyPermissionState(status: AutomationPermission.status(bundleIdentifier: bundleIdentifier))
+  }
+
+  @MainActor
+  func requestPermission() {
+    guard isInstalled else { return }
+    _ = AutomationPermission.request(bundleIdentifier: bundleIdentifier)
+  }
+
+  @MainActor
+  private var isInstalled: Bool {
+    if NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) != nil {
+      return true
+    }
+
+    return appPaths.contains { appPath in
+      FileManager.default.fileExists(atPath: (appPath as NSString).expandingTildeInPath)
+    }
+  }
+
+  static let all: [NotchyPermissionTarget] = [
+    NotchyPermissionTarget(
+      displayName: "Apple Music",
+      bundleIdentifier: "com.apple.Music",
+      iconSource: "Apple Music",
+      appPaths: ["/System/Applications/Music.app", "/Applications/Music.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "QuickTime Player",
+      bundleIdentifier: "com.apple.QuickTimePlayerX",
+      iconSource: "QuickTime Player",
+      appPaths: ["/System/Applications/QuickTime Player.app", "/Applications/QuickTime Player.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Chrome Canary",
+      bundleIdentifier: "com.google.Chrome.canary",
+      iconSource: "Chrome Canary",
+      appPaths: ["/Applications/Google Chrome Canary.app", "~/Applications/Google Chrome Canary.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Google Chrome",
+      bundleIdentifier: "com.google.Chrome",
+      iconSource: "Google Chrome",
+      appPaths: ["/Applications/Google Chrome.app", "~/Applications/Google Chrome.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Arc",
+      bundleIdentifier: "company.thebrowser.Browser",
+      iconSource: "Arc",
+      appPaths: ["/Applications/Arc.app", "~/Applications/Arc.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Brave Browser",
+      bundleIdentifier: "com.brave.Browser",
+      iconSource: "Brave Browser",
+      appPaths: ["/Applications/Brave Browser.app", "~/Applications/Brave Browser.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Microsoft Edge",
+      bundleIdentifier: "com.microsoft.edgemac",
+      iconSource: "Microsoft Edge",
+      appPaths: ["/Applications/Microsoft Edge.app", "~/Applications/Microsoft Edge.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Edge Canary",
+      bundleIdentifier: "com.microsoft.edgemac.Canary",
+      iconSource: "Edge Canary",
+      appPaths: ["/Applications/Microsoft Edge Canary.app", "~/Applications/Microsoft Edge Canary.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Dia",
+      bundleIdentifier: "company.thebrowser.dia",
+      iconSource: "Dia",
+      appPaths: ["/Applications/Dia.app", "~/Applications/Dia.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Vivaldi",
+      bundleIdentifier: "com.vivaldi.Vivaldi",
+      iconSource: "Vivaldi",
+      appPaths: ["/Applications/Vivaldi.app", "~/Applications/Vivaldi.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Opera",
+      bundleIdentifier: "com.operasoftware.Opera",
+      iconSource: "Opera",
+      appPaths: ["/Applications/Opera.app", "~/Applications/Opera.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Opera GX",
+      bundleIdentifier: "com.operasoftware.OperaGX",
+      iconSource: "Opera GX",
+      appPaths: ["/Applications/Opera GX.app", "~/Applications/Opera GX.app"]
+    ),
+    NotchyPermissionTarget(
+      displayName: "Safari",
+      bundleIdentifier: "com.apple.Safari",
+      iconSource: "Safari",
+      appPaths: ["/Applications/Safari.app", "/System/Applications/Safari.app"]
+    )
+  ]
+}
+
+private enum NotchyPermissionState: Equatable {
+  case allowed
+  case denied
+  case needsApproval
+  case notInstalled
+  case notRunning
+  case unknown(OSStatus)
+
+  init(status: OSStatus) {
+    switch Int(status) {
+    case Int(noErr):
+      self = .allowed
+    case -1743:
+      self = .denied
+    case -1744:
+      self = .needsApproval
+    case -600:
+      self = .notRunning
+    default:
+      self = .unknown(status)
+    }
+  }
+
+  var title: String {
+    switch self {
+    case .allowed:
+      return "Allowed"
+    case .denied:
+      return "Denied"
+    case .needsApproval:
+      return "Needs Approval"
+    case .notInstalled:
+      return "Not Installed"
+    case .notRunning:
+      return "Not Running"
+    case let .unknown(status):
+      return "Status \(status)"
+    }
+  }
+
+  var color: Color {
+    switch self {
+    case .allowed:
+      return Color(nsColor: .systemGreen)
+    case .denied:
+      return Color(nsColor: .systemRed)
+    case .needsApproval:
+      return Color(nsColor: .systemYellow)
+    case .notInstalled:
+      return Color(nsColor: .tertiaryLabelColor)
+    case .notRunning:
+      return Color(nsColor: .tertiaryLabelColor)
+    case .unknown:
+      return Color(nsColor: .systemOrange)
+    }
+  }
+
+  var canRequest: Bool {
+    self != .allowed && self != .notInstalled && self != .notRunning
+  }
+}
+
+private enum ScreenRecordingPermission {
+  @MainActor
+  static var state: NotchyPermissionState {
+    CGPreflightScreenCaptureAccess() ? .allowed : .needsApproval
+  }
+
+  @MainActor
+  static func request() {
+    _ = CGRequestScreenCaptureAccess()
+  }
+}
+
+private enum SystemSettingsNavigator {
+  static func openAutomationPrivacy() {
+    let urlStrings = [
+      "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Automation"
+    ]
+
+    for urlString in urlStrings {
+      guard let url = URL(string: urlString) else { continue }
+
+      if NSWorkspace.shared.open(url) {
+        return
+      }
+    }
+  }
+
+  static func openScreenRecordingPrivacy() {
+    let urlStrings = [
+      "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture"
+    ]
+
+    for urlString in urlStrings {
+      guard let url = URL(string: urlString) else { continue }
+
+      if NSWorkspace.shared.open(url) {
+        return
+      }
+    }
+  }
+}
+
 private struct NotchShape: InsettableShape {
   var insetAmount: CGFloat = 0
 
@@ -2165,14 +3042,44 @@ private struct NotchShape: InsettableShape {
   }
 }
 
+private enum IslandDisplayState {
+  case conference(ConferenceSession)
+  case nowPlaying(NowPlayingItem)
+  case audioOutput
+
+  static func resolve(
+    conferenceSession: ConferenceSession?,
+    nowPlayingItem: NowPlayingItem?
+  ) -> IslandDisplayState {
+    if let conferenceSession {
+      return .conference(conferenceSession)
+    }
+
+    if let nowPlayingItem {
+      return .nowPlaying(nowPlayingItem)
+    }
+
+    return .audioOutput
+  }
+}
+
 private struct IslandOverlayView: View {
   @StateObject private var nowPlayingMonitor = NowPlayingMonitor()
+  @StateObject private var conferenceMonitor = ConferenceMonitor()
   @StateObject private var audioOutputMonitor = AudioOutputMonitor()
+  @ObservedObject private var settings = NotchySettings.shared
   @ObservedObject var hoverState: IslandHoverState
   @State private var contentReveal = false
 
   private var isHovered: Bool {
     hoverState.isHovered
+  }
+
+  private var displayState: IslandDisplayState {
+    IslandDisplayState.resolve(
+      conferenceSession: conferenceMonitor.session,
+      nowPlayingItem: nowPlayingMonitor.item
+    )
   }
 
   var body: some View {
@@ -2192,11 +3099,16 @@ private struct IslandOverlayView: View {
     .onChange(of: isHovered) { _, hovered in
       if hovered {
         nowPlayingMonitor.requestRefresh()
-        contentReveal = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
-          if hoverState.isHovered {
-            contentReveal = true
+        conferenceMonitor.requestRefresh()
+        if settings.animationsEnabled {
+          contentReveal = false
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            if hoverState.isHovered {
+              contentReveal = true
+            }
           }
+        } else {
+          contentReveal = true
         }
       } else {
         contentReveal = false
@@ -2223,7 +3135,7 @@ private struct IslandOverlayView: View {
       alignment: .top
     )
     .clipped()
-    .animation(DemoMetrics.expansionAnimation, value: isHovered)
+    .animation(settings.animationsEnabled ? DemoMetrics.expansionAnimation : nil, value: isHovered)
     .background(
       shape
         .fill(Color.black.opacity(0.98))
@@ -2249,16 +3161,78 @@ private struct IslandOverlayView: View {
 
   @ViewBuilder
   private var islandContent: some View {
-    if let item = nowPlayingMonitor.item {
+    switch displayState {
+    case let .conference(session):
+      conferenceContent(session)
+    case let .nowPlaying(item):
       nowPlayingContent(item)
-    } else {
+    case .audioOutput:
       audioOutputContent
     }
   }
 
+  private func conferenceContent(_ session: ConferenceSession) -> some View {
+    HStack(spacing: 12) {
+      MediaOutputIconView(
+        route: audioOutputMonitor.route,
+        isPlaying: true,
+        isRevealed: contentReveal,
+        badgeSymbolName: "video.fill"
+      )
+      .stagedAppearance(isVisible: contentReveal, delay: 0.05, yOffset: 2)
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text(session.title)
+          .font(.system(size: 13, weight: .semibold, design: .rounded))
+          .foregroundStyle(.white.opacity(0.96))
+          .lineLimit(1)
+          .truncationMode(.tail)
+          .stagedAppearance(isVisible: contentReveal, delay: 0.11, yOffset: 3)
+
+        HStack(spacing: 8) {
+          HStack(spacing: 5) {
+            MediaSourceAppIconView(source: session.source, size: 13)
+
+            Text(session.subtitle)
+              .font(.system(size: 11, weight: .medium, design: .rounded))
+              .foregroundStyle(.white.opacity(0.62))
+              .lineLimit(1)
+              .truncationMode(.tail)
+          }
+          .stagedAppearance(isVisible: contentReveal, delay: 0.17, yOffset: 3)
+
+          Spacer(minLength: 0)
+
+          HStack(spacing: 7) {
+            Text("Live")
+              .font(.system(size: 10, weight: .semibold, design: .rounded))
+              .foregroundStyle(Color(nsColor: .systemGreen).opacity(0.9))
+              .lineLimit(1)
+
+            MiniAudioLevelMeterView(
+              animated: isHovered && contentReveal && settings.animationsEnabled,
+              color: Color(nsColor: .systemGreen).opacity(0.84)
+            )
+            .frame(width: 22, height: 10)
+          }
+          .stagedAppearance(isVisible: contentReveal, delay: 0.2, yOffset: 2)
+        }
+      }
+
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: DemoMetrics.expandedSize.width - 48, alignment: .leading)
+    .padding(.horizontal, 24)
+    .padding(.top, DemoMetrics.expandedContentTopInset - 2)
+  }
+
   private func nowPlayingContent(_ item: NowPlayingItem) -> some View {
     HStack(spacing: 12) {
-      MediaOutputIconView(route: audioOutputMonitor.route, isPlaying: item.isPlaying, isRevealed: contentReveal)
+      MediaOutputIconView(
+        route: audioOutputMonitor.route,
+        isPlaying: item.isPlaying || item.hasUnknownPlaybackState,
+        isRevealed: contentReveal
+      )
         .stagedAppearance(isVisible: contentReveal, delay: 0.05, yOffset: 2)
 
       VStack(alignment: .leading, spacing: 4) {
@@ -2270,25 +3244,21 @@ private struct IslandOverlayView: View {
           .stagedAppearance(isVisible: contentReveal, delay: 0.11, yOffset: 3)
 
         HStack(spacing: 8) {
-          Text(item.subtitle)
-            .font(.system(size: 11, weight: .medium, design: .rounded))
-            .foregroundStyle(.white.opacity(0.62))
-            .lineLimit(1)
-            .truncationMode(.tail)
+          HStack(spacing: 5) {
+            MediaSourceAppIconView(source: item.source, size: 13)
+
+            Text(item.subtitle)
+              .font(.system(size: 11, weight: .medium, design: .rounded))
+              .foregroundStyle(.white.opacity(0.62))
+              .lineLimit(1)
+              .truncationMode(.tail)
+          }
             .stagedAppearance(isVisible: contentReveal, delay: 0.17, yOffset: 3)
 
           Spacer(minLength: 0)
 
-          Group {
-            if isHovered {
-              TimelineView(.periodic(from: .now, by: 0.5)) { context in
-                timeLabel(item.timeLabel(at: context.date))
-              }
-            } else {
-              timeLabel(item.timeLabel)
-            }
-          }
-          .stagedAppearance(isVisible: contentReveal, delay: 0.2, yOffset: 2)
+          playbackStatus(for: item)
+            .stagedAppearance(isVisible: contentReveal, delay: 0.2, yOffset: 2)
         }
 
         playbackIndicator(for: item)
@@ -2303,12 +3273,35 @@ private struct IslandOverlayView: View {
   }
 
   @ViewBuilder
+  private func playbackStatus(for item: NowPlayingItem) -> some View {
+    if item.hasTimedProgress {
+      Group {
+        if isHovered {
+          TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            timeLabel(item.timeLabel(at: context.date))
+          }
+        } else {
+          timeLabel(item.timeLabel)
+        }
+      }
+    } else if item.isPlaying || item.hasUnknownPlaybackState {
+      HStack(spacing: 7) {
+        timeLabel(item.timeLabel)
+
+        MiniAudioLevelMeterView(
+          animated: isHovered && contentReveal && settings.animationsEnabled && (item.isPlaying || item.hasUnknownPlaybackState),
+          color: .white.opacity(0.62)
+        )
+        .frame(width: 22, height: 10)
+      }
+    } else {
+      timeLabel(item.timeLabel)
+    }
+  }
+
+  @ViewBuilder
   private func playbackIndicator(for item: NowPlayingItem) -> some View {
-    if item.duration <= 0 && item.isPlaying {
-      AudioLevelWaveformView(animated: isHovered && contentReveal)
-        .frame(height: 10)
-        .padding(.top, 1)
-    } else if isHovered {
+    if isHovered {
       TimelineView(.periodic(from: .now, by: 0.5)) { context in
         PlaybackProgressView(
           fraction: item.progressFraction(at: context.date),
@@ -2362,12 +3355,13 @@ private struct MediaOutputIconView: View {
   var route: AudioOutputRoute
   var isPlaying: Bool
   var isRevealed: Bool
+  var badgeSymbolName: String? = nil
 
   var body: some View {
     ZStack(alignment: .bottomTrailing) {
       AudioOutputIconView(route: route, isRevealed: isRevealed)
 
-      Image(systemName: isPlaying ? "play.fill" : "pause.fill")
+      Image(systemName: badgeSymbolName ?? (isPlaying ? "play.fill" : "pause.fill"))
         .font(.system(size: 7, weight: .bold))
         .foregroundStyle(.black.opacity(0.86))
         .frame(width: 13, height: 13)
@@ -2379,7 +3373,202 @@ private struct MediaOutputIconView: View {
   }
 }
 
+private struct MediaSourceAppIconView: View {
+  var source: String
+  var size: CGFloat = 34
+
+  var body: some View {
+    ZStack {
+      if let image = MediaSourceAppIconResolver.icon(for: source) {
+        Image(nsImage: image)
+          .resizable()
+          .interpolation(.high)
+          .aspectRatio(contentMode: .fit)
+          .frame(width: imageSize, height: imageSize)
+          .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+      } else {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+          .fill(.white.opacity(0.12))
+
+        Image(systemName: "play.rectangle.fill")
+          .font(.system(size: fallbackSymbolSize, weight: .semibold))
+          .foregroundStyle(.white.opacity(0.84))
+      }
+    }
+    .frame(width: size, height: size)
+  }
+
+  private var imageSize: CGFloat {
+    size >= 24 ? size - 2 : size
+  }
+
+  private var cornerRadius: CGFloat {
+    max(3, size * 0.22)
+  }
+
+  private var fallbackSymbolSize: CGFloat {
+    size >= 24 ? 15 : 8
+  }
+}
+
+@MainActor
+private enum MediaSourceAppIconResolver {
+  private struct IconSpec {
+    let bundleIdentifiers: [String]
+    let appPaths: [String]
+  }
+
+  private static var cache: [String: NSImage] = [:]
+  private static var misses = Set<String>()
+
+  private static let specs: [(matches: [String], spec: IconSpec)] = [
+    (
+      matches: ["chrome canary"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.google.Chrome.canary"],
+        appPaths: ["/Applications/Google Chrome Canary.app", "~/Applications/Google Chrome Canary.app"]
+      )
+    ),
+    (
+      matches: ["google chrome", "chrome"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.google.Chrome"],
+        appPaths: ["/Applications/Google Chrome.app", "~/Applications/Google Chrome.app"]
+      )
+    ),
+    (
+      matches: ["arc"],
+      spec: IconSpec(
+        bundleIdentifiers: ["company.thebrowser.Browser"],
+        appPaths: ["/Applications/Arc.app", "~/Applications/Arc.app"]
+      )
+    ),
+    (
+      matches: ["brave"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.brave.Browser"],
+        appPaths: ["/Applications/Brave Browser.app", "~/Applications/Brave Browser.app"]
+      )
+    ),
+    (
+      matches: ["edge canary"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.microsoft.edgemac.Canary"],
+        appPaths: ["/Applications/Microsoft Edge Canary.app", "~/Applications/Microsoft Edge Canary.app"]
+      )
+    ),
+    (
+      matches: ["microsoft edge", "edge"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.microsoft.edgemac"],
+        appPaths: ["/Applications/Microsoft Edge.app", "~/Applications/Microsoft Edge.app"]
+      )
+    ),
+    (
+      matches: ["dia"],
+      spec: IconSpec(
+        bundleIdentifiers: ["company.thebrowser.dia", "com.thebrowsercompany.dia"],
+        appPaths: ["/Applications/Dia.app", "~/Applications/Dia.app"]
+      )
+    ),
+    (
+      matches: ["vivaldi"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.vivaldi.Vivaldi"],
+        appPaths: ["/Applications/Vivaldi.app", "~/Applications/Vivaldi.app"]
+      )
+    ),
+    (
+      matches: ["opera gx"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.operasoftware.OperaGX"],
+        appPaths: ["/Applications/Opera GX.app", "~/Applications/Opera GX.app"]
+      )
+    ),
+    (
+      matches: ["opera"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.operasoftware.Opera"],
+        appPaths: ["/Applications/Opera.app", "~/Applications/Opera.app"]
+      )
+    ),
+    (
+      matches: ["quicktime", "quick time"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.apple.QuickTimePlayerX"],
+        appPaths: ["/System/Applications/QuickTime Player.app", "/Applications/QuickTime Player.app"]
+      )
+    ),
+    (
+      matches: ["apple music", "music"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.apple.Music"],
+        appPaths: ["/System/Applications/Music.app", "/Applications/Music.app"]
+      )
+    ),
+    (
+      matches: ["safari"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.apple.Safari"],
+        appPaths: ["/Applications/Safari.app", "/System/Applications/Safari.app"]
+      )
+    ),
+    (
+      matches: ["microsoft teams", "teams"],
+      spec: IconSpec(
+        bundleIdentifiers: ["com.microsoft.teams2", "com.microsoft.teams"],
+        appPaths: ["/Applications/Microsoft Teams.app", "~/Applications/Microsoft Teams.app"]
+      )
+    )
+  ]
+
+  static func icon(for source: String) -> NSImage? {
+    let key = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+    guard !key.isEmpty, !misses.contains(key) else {
+      return nil
+    }
+
+    if let cached = cache[key] {
+      return cached
+    }
+
+    guard let spec = specs.first(where: { entry in
+      entry.matches.contains { key.contains($0) }
+    })?.spec else {
+      misses.insert(key)
+      return nil
+    }
+
+    guard let image = resolveIcon(for: spec) else {
+      misses.insert(key)
+      return nil
+    }
+
+    cache[key] = image
+    return image
+  }
+
+  private static func resolveIcon(for spec: IconSpec) -> NSImage? {
+    for bundleIdentifier in spec.bundleIdentifiers {
+      if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+        return NSWorkspace.shared.icon(forFile: appURL.path)
+      }
+    }
+
+    for appPath in spec.appPaths {
+      let expandedPath = (appPath as NSString).expandingTildeInPath
+      if FileManager.default.fileExists(atPath: expandedPath) {
+        return NSWorkspace.shared.icon(forFile: expandedPath)
+      }
+    }
+
+    return nil
+  }
+}
+
 private struct StagedAppearanceModifier: ViewModifier {
+  @ObservedObject private var settings = NotchySettings.shared
   var isVisible: Bool
   var delay: Double
   var yOffset: CGFloat
@@ -2389,9 +3578,11 @@ private struct StagedAppearanceModifier: ViewModifier {
       .opacity(isVisible ? 1 : 0)
       .offset(y: isVisible ? 0 : yOffset)
       .animation(
-        isVisible
-          ? .easeOut(duration: 0.32).delay(delay)
-          : .easeOut(duration: 0.06),
+        settings.animationsEnabled
+          ? (isVisible
+            ? .easeOut(duration: 0.32).delay(delay)
+            : .easeOut(duration: 0.06))
+          : nil,
         value: isVisible
       )
   }
@@ -2408,6 +3599,7 @@ private extension View {
 }
 
 private struct AudioOutputIconView: View {
+  @ObservedObject private var settings = NotchySettings.shared
   var route: AudioOutputRoute
   var isRevealed = true
 
@@ -2427,12 +3619,14 @@ private struct AudioOutputIconView: View {
             style: StrokeStyle(lineWidth: 2, lineCap: .round)
           )
           .frame(width: 32, height: 32)
-          .rotationEffect(.degrees(isRevealed ? -90 : -210))
+          .rotationEffect(.degrees(settings.animationsEnabled ? (isRevealed ? -90 : -210) : -90))
           .opacity(isRevealed ? 1 : 0)
           .animation(
-            isRevealed
-              ? .easeOut(duration: 0.48).delay(0.1)
-              : .easeOut(duration: 0.08),
+            settings.animationsEnabled
+              ? (isRevealed
+                ? .easeOut(duration: 0.48).delay(0.1)
+                : .easeOut(duration: 0.08))
+              : nil,
             value: isRevealed
           )
       }
@@ -2460,6 +3654,7 @@ private struct AudioOutputIconView: View {
 }
 
 private struct PlaybackProgressView: View {
+  @ObservedObject private var settings = NotchySettings.shared
   var fraction: Double
   var reveal: Double = 1
 
@@ -2467,18 +3662,20 @@ private struct PlaybackProgressView: View {
     GeometryReader { proxy in
       ZStack(alignment: .leading) {
         Capsule()
-          .fill(.white.opacity(0.14))
+          .fill(Color(nsColor: .systemGreen).opacity(0.18))
 
         Capsule()
-          .fill(.white.opacity(0.82))
+          .fill(Color(nsColor: .systemGreen).opacity(0.92))
           .frame(width: proxy.size.width * clampedFraction * clampedReveal)
       }
       .clipShape(Capsule())
     }
     .animation(
-      clampedReveal > 0
-        ? .easeOut(duration: 0.48).delay(0.22)
-        : .easeOut(duration: 0.06),
+      settings.animationsEnabled
+        ? (clampedReveal > 0
+          ? .easeOut(duration: 0.48).delay(0.22)
+          : .easeOut(duration: 0.06))
+        : nil,
       value: clampedReveal
     )
   }
@@ -2492,11 +3689,12 @@ private struct PlaybackProgressView: View {
   }
 }
 
-private struct AudioLevelWaveformView: View {
+private struct MiniAudioLevelMeterView: View {
   var animated = true
+  var color: Color = .white.opacity(0.72)
 
-  private let barCount = 24
-  private let spacing: CGFloat = 3
+  private let baseLevels: [CGFloat] = [0.42, 0.76, 0.56, 0.92, 0.48]
+  private let spacing: CGFloat = 2
 
   @ViewBuilder
   var body: some View {
@@ -2511,18 +3709,16 @@ private struct AudioLevelWaveformView: View {
 
   private func waveform(at date: Date) -> some View {
     GeometryReader { proxy in
-      let availableWidth = max(1, proxy.size.width - CGFloat(barCount - 1) * spacing)
-      let barWidth = max(2, availableWidth / CGFloat(barCount))
+      let barWidth = max(2, (proxy.size.width - CGFloat(baseLevels.count - 1) * spacing) / CGFloat(baseLevels.count))
       let time = date.timeIntervalSinceReferenceDate
 
       HStack(alignment: .center, spacing: spacing) {
-        ForEach(0..<barCount, id: \.self) { index in
-          let wave = sin(time * 5.4 + Double(index) * 0.58)
-          let counterWave = sin(time * 3.2 + Double(index) * 0.31)
-          let level = 0.28 + 0.72 * abs(wave * 0.72 + counterWave * 0.28)
+        ForEach(0..<baseLevels.count, id: \.self) { index in
+          let pulse = animated ? CGFloat(sin(time * 4.8 + Double(index) * 0.82)) * 0.16 : 0
+          let level = min(1, max(0.28, baseLevels[index] + pulse))
 
           Capsule()
-            .fill(.white.opacity(0.72))
+            .fill(color)
             .frame(width: barWidth, height: max(2, proxy.size.height * level))
         }
       }
