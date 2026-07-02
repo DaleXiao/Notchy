@@ -5,6 +5,7 @@ import CoreGraphics
 import Darwin
 import Foundation
 import IOKit
+import ServiceManagement
 import SwiftUI
 
 private enum DemoMetrics {
@@ -54,7 +55,13 @@ private final class NotchySettings: ObservableObject {
     }
   }
 
+  @Published private(set) var openAtLoginEnabled: Bool
+  @Published private(set) var openAtLoginError: String?
+
   private init() {
+    openAtLoginEnabled = LoginItemController.isEnabled
+    openAtLoginError = nil
+
     if UserDefaults.standard.object(forKey: Self.animationsEnabledKey) == nil {
       animationsEnabled = true
     } else {
@@ -65,6 +72,37 @@ private final class NotchySettings: ObservableObject {
       showsDockIcon = true
     } else {
       showsDockIcon = UserDefaults.standard.bool(forKey: Self.showsDockIconKey)
+    }
+  }
+
+  func refreshOpenAtLoginStatus() {
+    openAtLoginEnabled = LoginItemController.isEnabled
+  }
+
+  func setOpenAtLoginEnabled(_ isEnabled: Bool) {
+    do {
+      try LoginItemController.setEnabled(isEnabled)
+      openAtLoginError = nil
+    } catch {
+      openAtLoginError = error.localizedDescription
+    }
+
+    refreshOpenAtLoginStatus()
+  }
+}
+
+private enum LoginItemController {
+  static var isEnabled: Bool {
+    SMAppService.mainApp.status == .enabled
+  }
+
+  static func setEnabled(_ isEnabled: Bool) throws {
+    if isEnabled {
+      if SMAppService.mainApp.status != .enabled {
+        try SMAppService.mainApp.register()
+      }
+    } else if SMAppService.mainApp.status == .enabled {
+      try SMAppService.mainApp.unregister()
     }
   }
 }
@@ -931,6 +969,13 @@ private enum TeamsConferenceReader {
     "meeting",
     "call",
     "teams meeting",
+    "meet now",
+    "calling",
+    "ringing",
+    "webinar",
+    "live event",
+    "participant",
+    "participants",
     "screen share",
     "sharing",
     "presenting",
@@ -954,8 +999,14 @@ private enum TeamsConferenceReader {
   static func currentSession() -> ConferenceSession? {
     let applications = runningApplications(for: app)
 
-    guard !applications.isEmpty,
-          let title = matchingMeetingWindowTitle(for: applications) else {
+    guard !applications.isEmpty else {
+      return nil
+    }
+
+    let title = matchingMeetingWindowTitle(for: applications)
+      ?? (hasActiveCallHelper() ? "Teams Meeting" : nil)
+
+    guard let title else {
       return nil
     }
 
@@ -968,18 +1019,23 @@ private enum TeamsConferenceReader {
   }
 
   private static func runningApplications(for app: ConferencingApp) -> [NSRunningApplication] {
-    var applications = app.bundleIdentifiers.flatMap {
+    let exactApplications = app.bundleIdentifiers.flatMap {
       NSRunningApplication.runningApplications(withBundleIdentifier: $0)
     }
 
-    if applications.isEmpty {
-      applications = NSWorkspace.shared.runningApplications.filter { runningApplication in
-        let localizedName = runningApplication.localizedName?.lowercased() ?? ""
-        return localizedName.contains("microsoft teams")
-      }
+    let relatedApplications = NSWorkspace.shared.runningApplications.filter { runningApplication in
+      let localizedName = runningApplication.localizedName?.lowercased() ?? ""
+      let bundleIdentifier = runningApplication.bundleIdentifier?.lowercased() ?? ""
+
+      return localizedName.contains("microsoft teams")
+        || localizedName == "msteams"
+        || bundleIdentifier.contains("com.microsoft.teams")
     }
 
-    return applications
+    var seenProcessIDs = Set<pid_t>()
+    return (exactApplications + relatedApplications).filter { application in
+      seenProcessIDs.insert(application.processIdentifier).inserted
+    }
   }
 
   private static func matchingMeetingWindowTitle(for applications: [NSRunningApplication]) -> String? {
@@ -994,17 +1050,26 @@ private enum TeamsConferenceReader {
 
     return windowInfo
       .compactMap { window -> String? in
-        guard let processID = processIdentifier(from: window),
-              processIDs.contains(processID),
+        guard isTeamsWindow(window, matching: processIDs),
               isVisibleWindow(window),
               let title = window[kCGWindowName as String] as? String,
-              isMeetingWindowTitle(title) else {
+              isLikelyMeetingWindowTitle(title) else {
           return nil
         }
 
         return title
       }
       .first
+  }
+
+  private static func isTeamsWindow(_ window: [String: Any], matching processIDs: Set<pid_t>) -> Bool {
+    if let processID = processIdentifier(from: window),
+       processIDs.contains(processID) {
+      return true
+    }
+
+    let ownerName = (window[kCGWindowOwnerName as String] as? String ?? "").lowercased()
+    return ownerName.contains("microsoft teams") || ownerName == "msteams"
   }
 
   private static func processIdentifier(from window: [String: Any]) -> pid_t? {
@@ -1032,15 +1097,73 @@ private enum TeamsConferenceReader {
     return bounds.width >= 160 && bounds.height >= 120
   }
 
-  private static func isMeetingWindowTitle(_ title: String) -> Bool {
+  private static func isLikelyMeetingWindowTitle(_ title: String) -> Bool {
     let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
     guard !normalizedTitle.isEmpty,
-          positiveTitleTokens.contains(where: { normalizedTitle.contains($0) }) else {
+          normalizedTitle != "microsoft teams",
+          normalizedTitle != "teams" else {
       return false
     }
 
-    return !negativeTitleTokens.contains(where: { normalizedTitle.contains($0) })
+    guard !negativeTitleTokens.contains(where: { normalizedTitle.contains($0) }) else {
+      return false
+    }
+
+    return positiveTitleTokens.contains(where: { normalizedTitle.contains($0) })
+  }
+
+  private static func hasActiveCallHelper() -> Bool {
+    guard let output = processOutput(
+      executablePath: "/usr/bin/pgrep",
+      arguments: [
+        "-fl",
+        "Microsoft Teams|MSTeams|teams2|SlimCore|video_capture|audio\\.mojom"
+      ]
+    )?.lowercased() else {
+      return false
+    }
+
+    let teamsOutput = output
+      .split(separator: "\n")
+      .filter { line in
+        line.contains("microsoft teams")
+          || line.contains("msteams")
+          || line.contains("teams2")
+      }
+      .joined(separator: "\n")
+
+    let hasMediaService = teamsOutput.contains("video_capture.mojom.videocaptureservice")
+      || teamsOutput.contains("audio.mojom.audioservice")
+    let hasCallEngine = teamsOutput.contains("microsoft teams modulehost")
+      && teamsOutput.contains("slimcore")
+
+    return hasMediaService && hasCallEngine
+  }
+
+  private static func processOutput(executablePath: String, arguments: [String]) -> String? {
+    let process = Process()
+    let pipe = Pipe()
+
+    process.executableURL = URL(fileURLWithPath: executablePath)
+    process.arguments = arguments
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+
+    do {
+      try process.run()
+    } catch {
+      return nil
+    }
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+      return nil
+    }
+
+    return String(data: data, encoding: .utf8)
   }
 
   private static func normalizedMeetingTitle(_ title: String) -> String {
@@ -2640,30 +2763,28 @@ private struct NotchySettingsView: View {
     }
     .padding(20)
     .frame(width: 560, height: 460)
+    .onAppear {
+      settings.refreshOpenAtLoginStatus()
+    }
   }
 
   private var generalSettings: some View {
-    VStack(spacing: 10) {
-      HStack(spacing: 12) {
-        Text("Animation")
-          .font(.headline)
+    VStack(alignment: .leading, spacing: 10) {
+      SettingsToggleRow(title: "Animation", isOn: $settings.animationsEnabled)
+      SettingsToggleRow(title: "Show Dock Icon", isOn: $settings.showsDockIcon)
+      SettingsToggleRow(
+        title: "Open at Login",
+        isOn: Binding(
+          get: { settings.openAtLoginEnabled },
+          set: { settings.setOpenAtLoginEnabled($0) }
+        )
+      )
 
-        Spacer()
-
-        Toggle("Animation", isOn: $settings.animationsEnabled)
-          .toggleStyle(.switch)
-          .labelsHidden()
-      }
-
-      HStack(spacing: 12) {
-        Text("Show Dock Icon")
-          .font(.headline)
-
-        Spacer()
-
-        Toggle("Show Dock Icon", isOn: $settings.showsDockIcon)
-          .toggleStyle(.switch)
-          .labelsHidden()
+      if let error = settings.openAtLoginError {
+        Text(error)
+          .font(.system(size: 11))
+          .foregroundStyle(.secondary)
+          .padding(.horizontal, 10)
       }
     }
     .padding(.horizontal, 10)
@@ -2714,7 +2835,7 @@ private struct NotchySettingsView: View {
 
       ScrollView {
         LazyVStack(spacing: 8) {
-          ForEach(NotchyPermissionTarget.all) { target in
+          ForEach(NotchyPermissionTarget.installed) { target in
             NotchyPermissionRow(
               target: target,
               refreshToken: permissionRefreshToken
@@ -2725,6 +2846,64 @@ private struct NotchySettingsView: View {
         }
         .padding(.vertical, 2)
       }
+    }
+  }
+}
+
+private struct SettingsToggleRow: View {
+  let title: String
+  @Binding var isOn: Bool
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Text(title)
+        .font(.headline)
+
+      Spacer()
+
+      SwitchControl(isOn: $isOn)
+        .frame(width: 42, height: 24)
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 8)
+  }
+}
+
+private struct SwitchControl: NSViewRepresentable {
+  @Binding var isOn: Bool
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(isOn: $isOn)
+  }
+
+  func makeNSView(context: Context) -> NSSwitch {
+    let control = NSSwitch()
+    control.controlSize = .regular
+    control.state = isOn ? .on : .off
+    control.target = context.coordinator
+    control.action = #selector(Coordinator.switchDidChange(_:))
+    return control
+  }
+
+  func updateNSView(_ nsView: NSSwitch, context: Context) {
+    context.coordinator.isOn = $isOn
+
+    let targetState: NSControl.StateValue = isOn ? .on : .off
+    if nsView.state != targetState {
+      nsView.state = targetState
+    }
+  }
+
+  final class Coordinator: NSObject {
+    var isOn: Binding<Bool>
+
+    init(isOn: Binding<Bool>) {
+      self.isOn = isOn
+    }
+
+    @MainActor
+    @objc func switchDidChange(_ sender: NSSwitch) {
+      isOn.wrappedValue = sender.state == .on
     }
   }
 }
@@ -2811,7 +2990,7 @@ private struct NotchyPermissionTarget: Identifiable {
   }
 
   @MainActor
-  private var isInstalled: Bool {
+  var isInstalled: Bool {
     if NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) != nil {
       return true
     }
@@ -2819,6 +2998,11 @@ private struct NotchyPermissionTarget: Identifiable {
     return appPaths.contains { appPath in
       FileManager.default.fileExists(atPath: (appPath as NSString).expandingTildeInPath)
     }
+  }
+
+  @MainActor
+  static var installed: [NotchyPermissionTarget] {
+    all.filter(\.isInstalled)
   }
 
   static let all: [NotchyPermissionTarget] = [
@@ -3042,6 +3226,133 @@ private struct NotchShape: InsettableShape {
   }
 }
 
+private struct IslandBackgroundView: View {
+  var isHovered: Bool
+
+  var body: some View {
+    let shape = NotchShape()
+    let expandedOpacity = isHovered ? 1.0 : 0.0
+
+    ZStack {
+      shape.fill(Color.black)
+        .opacity(1 - expandedOpacity)
+
+      Group {
+        VisualEffectBlurView(
+          material: .underWindowBackground,
+          blendingMode: .behindWindow
+        )
+        .clipShape(shape)
+        .mask(glassRevealMask)
+
+        shape.fill(topBlackGradient)
+        shape.fill(glassTintGradient)
+        shape.fill(bottomFrostGradient).blendMode(.plusLighter)
+      }
+      .opacity(expandedOpacity)
+    }
+    .overlay(border(for: shape).opacity(expandedOpacity))
+  }
+
+  private var topBlackGradient: LinearGradient {
+    LinearGradient(
+      stops: [
+        .init(color: .black, location: 0),
+        .init(color: .black, location: 0.28),
+        .init(color: .black.opacity(isHovered ? 0.82 : 0.96), location: 0.44),
+        .init(color: .black.opacity(isHovered ? 0.28 : 0.54), location: 0.72),
+        .init(color: .black.opacity(isHovered ? 0.12 : 0.34), location: 1)
+      ],
+      startPoint: .top,
+      endPoint: .bottom
+    )
+  }
+
+  private var glassRevealMask: LinearGradient {
+    LinearGradient(
+      stops: [
+        .init(color: .clear, location: 0),
+        .init(color: .clear, location: 0.26),
+        .init(color: .white.opacity(isHovered ? 0.55 : 0.18), location: 0.48),
+        .init(color: .white.opacity(isHovered ? 1.0 : 0.62), location: 1)
+      ],
+      startPoint: .top,
+      endPoint: .bottom
+    )
+  }
+
+  private var glassTintGradient: LinearGradient {
+    LinearGradient(
+      stops: [
+        .init(color: .clear, location: 0),
+        .init(color: .clear, location: 0.38),
+        .init(color: Color(red: 0.04, green: 0.04, blue: 0.045).opacity(isHovered ? 0.08 : 0.04), location: 0.68),
+        .init(color: Color(red: 0.10, green: 0.10, blue: 0.11).opacity(isHovered ? 0.16 : 0.08), location: 1)
+      ],
+      startPoint: .top,
+      endPoint: .bottom
+    )
+  }
+
+  private var bottomFrostGradient: LinearGradient {
+    LinearGradient(
+      stops: [
+        .init(color: .clear, location: 0),
+        .init(color: .clear, location: 0.56),
+        .init(color: .white.opacity(isHovered ? 0.06 : 0.015), location: 0.82),
+        .init(color: .white.opacity(isHovered ? 0.16 : 0.04), location: 1)
+      ],
+      startPoint: .top,
+      endPoint: .bottom
+    )
+  }
+
+  private func border(for shape: NotchShape) -> some View {
+    shape
+      .strokeBorder(
+        isHovered
+          ? Color.white.opacity(0.13)
+          : Color.white.opacity(0.025),
+        lineWidth: 1
+      )
+      .mask(
+        LinearGradient(
+          stops: [
+            .init(color: .clear, location: 0),
+            .init(color: .clear, location: 0.50),
+            .init(color: .white.opacity(0.56), location: 0.76),
+            .init(color: .white, location: 1)
+          ],
+          startPoint: .top,
+          endPoint: .bottom
+        )
+      )
+  }
+}
+
+private struct VisualEffectBlurView: NSViewRepresentable {
+  var material: NSVisualEffectView.Material
+  var blendingMode: NSVisualEffectView.BlendingMode
+
+  func makeNSView(context: Context) -> NSVisualEffectView {
+    let view = NSVisualEffectView()
+    view.blendingMode = blendingMode
+    view.material = material
+    view.state = .active
+    view.appearance = NSAppearance(named: .darkAqua)
+    view.wantsLayer = true
+    view.layer?.backgroundColor = NSColor.clear.cgColor
+    return view
+  }
+
+  func updateNSView(_ view: NSVisualEffectView, context: Context) {
+    view.blendingMode = blendingMode
+    view.material = material
+    view.state = .active
+    view.appearance = NSAppearance(named: .darkAqua)
+  }
+}
+
 private enum IslandDisplayState {
   case conference(ConferenceSession)
   case nowPlaying(NowPlayingItem)
@@ -3136,25 +3447,7 @@ private struct IslandOverlayView: View {
     )
     .clipped()
     .animation(settings.animationsEnabled ? DemoMetrics.expansionAnimation : nil, value: isHovered)
-    .background(
-      shape
-        .fill(Color.black.opacity(0.98))
-        .overlay(
-          shape
-            .strokeBorder(
-              isHovered
-                ? Color.white.opacity(0.14)
-                : Color.white.opacity(0.03),
-              lineWidth: 1
-            )
-            .mask(
-              VStack(spacing: 0) {
-                Color.clear.frame(height: 2)
-                Color.white
-              }
-            )
-        )
-    )
+    .background(IslandBackgroundView(isHovered: isHovered))
     .clipShape(shape)
     .contentShape(shape)
   }
