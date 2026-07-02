@@ -692,11 +692,18 @@ private final class NowPlayingMonitor: ObservableObject {
       guard let lastTimedItem,
             lastTimedItem.isPlaying,
             let lastTimedItemSeenAt,
-            now.timeIntervalSince(lastTimedItemSeenAt) < transientMissGraceInterval else {
+            now.timeIntervalSince(lastTimedItemSeenAt) < transientMissGraceInterval,
+            BrowserNowPlayingReader.browserMediaSourceHasVisibleWindow(lastTimedItem.source) else {
+        clearLastTimedItem()
         return nil
       }
 
       return carriedTimedItem(from: lastTimedItem, at: now)
+    }
+
+    guard BrowserNowPlayingReader.browserMediaSourceHasVisibleWindow(nextItem.source) else {
+      clearLastTimedItem()
+      return nil
     }
 
     let stabilizedItem: NowPlayingItem
@@ -725,6 +732,11 @@ private final class NowPlayingMonitor: ObservableObject {
     carriedItem.timestamp = date
     lastTimedItem = carriedItem
     return carriedItem
+  }
+
+  private func clearLastTimedItem() {
+    lastTimedItem = nil
+    lastTimedItemSeenAt = nil
   }
 }
 
@@ -829,6 +841,11 @@ private enum NowPlayingReader {
 
         currentSource(using: bridge) { source in
           let item = item.withSource(source)
+          guard BrowserNowPlayingReader.browserMediaSourceHasVisibleWindow(item.source) else {
+            completion(nil)
+            return
+          }
+
           let priority = item.isPlaying
             ? (item.duration > 0 ? 118 : 86)
             : (item.duration > 0 ? 62 : 42)
@@ -1345,6 +1362,7 @@ private enum BrowserNowPlayingReader {
     let browser: Browser
     let applications: [NSRunningApplication]
     let order: Int
+    let hasVisibleWindow: Bool
 
     var isActive: Bool {
       applications.contains(where: \.isActive)
@@ -1444,12 +1462,25 @@ private enum BrowserNowPlayingReader {
     }
   }
 
+  static func browserMediaSourceHasVisibleWindow(_ source: String) -> Bool {
+    guard let browser = browser(matching: source) else {
+      return true
+    }
+
+    let applications = runningApplications(for: browser)
+    guard !applications.isEmpty else {
+      return false
+    }
+
+    return hasVisibleWindow(for: applications)
+  }
+
   private static func readBestCandidate() -> NowPlayingCandidate? {
     let states = browserStates()
     AppleScriptRunner.debugLog(
       "browser states: "
         + states
-          .map { "\($0.browser.displayName)(active=\($0.isActive))" }
+          .map { "\($0.browser.displayName)(active=\($0.isActive), visible=\($0.hasVisibleWindow))" }
           .joined(separator: ", ")
     )
     var playbackCandidates: [NowPlayingCandidate] = []
@@ -1603,6 +1634,10 @@ private enum BrowserNowPlayingReader {
       return nil
     }
 
+    guard isRunning(browser) else {
+      return nil
+    }
+
     let inactiveTabScan = includeInactiveTabs
       ? """
           repeat with browserWindow in windows
@@ -1619,6 +1654,7 @@ private enum BrowserNowPlayingReader {
       : ""
 
     let script = """
+      \(runningGuardScript(for: browser))
       tell application id "\(browser.bundleIdentifier)"
         repeat with browserWindow in windows
           try
@@ -1642,7 +1678,12 @@ private enum BrowserNowPlayingReader {
   }
 
   private static func browserActiveTabInfo(for browser: Browser) -> (title: String, url: String)? {
+    guard isRunning(browser) else {
+      return nil
+    }
+
     let script = """
+      \(runningGuardScript(for: browser))
       tell application id "\(browser.bundleIdentifier)"
         if (count of windows) is 0 then return ""
         set tabURL to URL of active tab of front window
@@ -1667,7 +1708,12 @@ private enum BrowserNowPlayingReader {
   }
 
   private static func browserMediaTabInfo(for browser: Browser) -> (title: String, url: String)? {
+    guard isRunning(browser) else {
+      return nil
+    }
+
     let script = """
+      \(runningGuardScript(for: browser))
       tell application id "\(browser.bundleIdentifier)"
         with timeout of 2 seconds
           repeat with browserWindow in windows
@@ -1706,6 +1752,39 @@ private enum BrowserNowPlayingReader {
     NSRunningApplication.runningApplications(withBundleIdentifier: browser.bundleIdentifier)
   }
 
+  private static func isRunning(_ browser: Browser) -> Bool {
+    !runningApplications(for: browser).isEmpty
+  }
+
+  private static func browser(matching source: String) -> Browser? {
+    let normalizedSource = normalizedBrowserSource(source)
+    guard !normalizedSource.isEmpty else {
+      return nil
+    }
+
+    return browsers.first { browser in
+      let appName = URL(fileURLWithPath: browser.appPath)
+        .deletingPathExtension()
+        .lastPathComponent
+      let aliases = [
+        browser.displayName,
+        appName,
+        browser.bundleIdentifier
+      ]
+
+      return aliases
+        .map(normalizedBrowserSource)
+        .contains(normalizedSource)
+    }
+  }
+
+  private static func normalizedBrowserSource(_ source: String) -> String {
+    source
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+      .filter { $0.isLetter || $0.isNumber }
+  }
+
   private static func browserStates() -> [BrowserState] {
     browsers
       .enumerated()
@@ -1716,7 +1795,17 @@ private enum BrowserNowPlayingReader {
           return nil
         }
 
-        return BrowserState(browser: browser, applications: applications, order: index)
+        let hasVisibleWindow = hasVisibleWindow(for: applications)
+        guard hasVisibleWindow else {
+          return nil
+        }
+
+        return BrowserState(
+          browser: browser,
+          applications: applications,
+          order: index,
+          hasVisibleWindow: hasVisibleWindow
+        )
       }
       .sorted { lhs, rhs in
         if lhs.isActive != rhs.isActive {
@@ -1725,6 +1814,52 @@ private enum BrowserNowPlayingReader {
 
         return lhs.order < rhs.order
       }
+  }
+
+  private static func hasVisibleWindow(for applications: [NSRunningApplication]) -> Bool {
+    let processIDs = Set(applications.map(\.processIdentifier))
+
+    guard let windowInfo = CGWindowListCopyWindowInfo(
+      [.optionOnScreenOnly, .excludeDesktopElements],
+      CGWindowID(0)
+    ) as? [[String: Any]] else {
+      return true
+    }
+
+    return windowInfo.contains { window in
+      guard let processID = processIdentifier(from: window),
+            processIDs.contains(processID),
+            isVisibleBrowserWindow(window) else {
+        return false
+      }
+
+      return true
+    }
+  }
+
+  private static func processIdentifier(from window: [String: Any]) -> pid_t? {
+    if let processIdentifier = window[kCGWindowOwnerPID as String] as? pid_t {
+      return processIdentifier
+    }
+
+    if let number = window[kCGWindowOwnerPID as String] as? NSNumber {
+      return pid_t(number.int32Value)
+    }
+
+    return nil
+  }
+
+  private static func isVisibleBrowserWindow(_ window: [String: Any]) -> Bool {
+    if let layer = window[kCGWindowLayer as String] as? Int, layer != 0 {
+      return false
+    }
+
+    guard let boundsDictionary = window[kCGWindowBounds as String] as? NSDictionary,
+          let bounds = CGRect(dictionaryRepresentation: boundsDictionary) else {
+      return true
+    }
+
+    return bounds.width >= 160 && bounds.height >= 120
   }
 
   private static func parsePlaybackInfo(_ output: String) -> BrowserPlaybackInfo? {
@@ -1755,6 +1890,16 @@ private enum BrowserNowPlayingReader {
       .replacingOccurrences(of: "\\", with: "\\\\")
       .replacingOccurrences(of: "\"", with: "\\\"")
       .replacingOccurrences(of: "\n", with: " ")
+  }
+
+  private static func runningGuardScript(for browser: Browser) -> String {
+    let appName = URL(fileURLWithPath: browser.appPath)
+      .deletingPathExtension()
+      .lastPathComponent
+
+    return """
+      if not (application "\(appleScriptStringLiteral(appName))" is running) then return ""
+      """
   }
 
   private static func isYouTubeWatchURL(_ url: String) -> Bool {
